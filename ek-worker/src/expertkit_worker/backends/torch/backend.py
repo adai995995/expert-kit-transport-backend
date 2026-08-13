@@ -28,6 +28,8 @@ type AcquireTorchWeights = Callable[
     ReadyWeightLease[TorchExpertWeights],
 ]
 
+_QUARANTINED_COMPLETIONS: list[object] = []
+
 
 class _TorchCompletion(BackendCompletion):
     """Retain ready weights and the submitting CUDA stream until result release."""
@@ -65,20 +67,23 @@ class _TorchCompletion(BackendCompletion):
         with self._lock:
             if self._closed:
                 return
+            if self._failed:
+                _QUARANTINED_COMPLETIONS.append(self)
+                return
             self._closed = True
             stream = self._stream
             waited = self._waited
-            failed = self._failed
 
         close_error: BaseException | None = None
-        if stream is not None and not waited and not failed:
+        if stream is not None and not waited:
             try:
                 stream.synchronize()
             except BaseException as error:
                 close_error = error
-        self._lease.close()
         if close_error is not None:
+            _QUARANTINED_COMPLETIONS.append(self)
             raise close_error
+        self._lease.close()
 
 
 class TorchBackend(ComputeBackend):
@@ -117,6 +122,7 @@ class TorchBackend(ComputeBackend):
         self._dtype = dtype
         self._device = resolved_device
         self._acquire_many = acquire_many
+        self._unsafe_leases: list[ReadyWeightLease[TorchExpertWeights]] = []
         self._capabilities = BackendCapabilities(
             supports_dynamic_tokens=True,
             supports_concurrent_batches=True,
@@ -281,9 +287,10 @@ class TorchBackend(ComputeBackend):
                 torch.cuda.current_stream(self._device).synchronize()
             except BaseException as error:
                 synchronization_error = error
-        lease.close()
         if synchronization_error is not None:
+            self._unsafe_leases.append(lease)
             raise BackendFatalError(
                 BackendFatalReason.ASYNC_EXECUTION,
                 str(synchronization_error),
             ) from synchronization_error
+        lease.close()

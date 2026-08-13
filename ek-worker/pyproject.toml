@@ -34,6 +34,7 @@ observability = [
     "opentelemetry-sdk==1.39.1",
     "prometheus-client==0.25.0",
 ]
+transfer-engine = ["expertkit-transport[transfer-engine]==0.1.0"]
 
 [tool.uv.sources]
 expertkit-proto = { workspace = true }

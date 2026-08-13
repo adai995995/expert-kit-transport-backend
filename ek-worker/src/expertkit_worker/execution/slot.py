@@ -139,8 +139,10 @@ class ExecutionSlot:
             transport_buffers.close()
             raise
         self._result: ExecutionResult | None = None
+        self._unsafe_completions: list[BackendCompletion] = []
         self._busy = False
         self._closed = False
+        self._quarantined = False
         self._state_lock = Lock()
 
     @property
@@ -169,6 +171,19 @@ class ExecutionSlot:
 
         with self._state_lock:
             return self._busy
+
+    @property
+    def quarantined(self) -> bool:
+        """Return whether fatal device work may still reference this slot."""
+
+        with self._state_lock:
+            return self._quarantined
+
+    def quarantine(self) -> None:
+        """Retain every fixed resource after an unsafe fatal execution."""
+
+        with self._state_lock:
+            self._quarantined = True
 
     def execute(
         self,
@@ -246,6 +261,8 @@ class ExecutionSlot:
 
         with self._state_lock:
             if self._closed:
+                return
+            if self._quarantined:
                 return
             if self._busy:
                 raise RuntimeError("cannot close an active computation slot")
@@ -381,9 +398,28 @@ class ExecutionSlot:
                 rejection = final_rejection
                 response_output = None
             return self._set_result(response_output, rejection, completion)
-        except BaseException:
+        except (BackendRequestError, ValueError):
+            # A request rejection is reusable only after all earlier stream work
+            # is terminal.  If the fence itself fails, retain completion state
+            # and promote the request error to an unsafe fatal.
+            try:
+                stream.synchronize()
+            except BaseException as error:
+                if completion is not None:
+                    self._unsafe_completions.append(completion)
+                raise BackendFatalError(
+                    BackendFatalReason.ASYNC_EXECUTION,
+                    str(error),
+                ) from error
             if completion is not None:
                 completion.close()
+            raise
+        except BaseException:
+            # The fatal reason is observed by WorkerExecutor only after this
+            # frame unwinds.  Keep Backend leases/resources alive until that
+            # executor quarantines the complete slot for process lifetime.
+            if completion is not None:
+                self._unsafe_completions.append(completion)
             raise
 
     def _copy_and_build_batch(
